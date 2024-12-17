@@ -219,13 +219,11 @@ def optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features,
     return best_text
 
 
-def optimize_prompt(model, preprocess, args, device, target_images=None, target_prompts=None):
+def optimize_prompt(model, tokenizer, preprocess, args, device, target_images=None, target_prompts=None):
     token_embedding = model.token_embedding
-    tokenizer = open_clip.tokenizer._tokenizer
-    tokenizer_funct = open_clip.get_tokenizer(args.clip_model)
 
     # get target features
-    all_target_features = get_target_feature(model, preprocess, tokenizer_funct, device, target_images=target_images, target_prompts=target_prompts)
+    all_target_features = get_target_feature(model, preprocess, tokenizer, device, target_images=target_images, target_prompts=target_prompts)
 
     # optimize prompt
     learned_prompt = optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features, args, device)
