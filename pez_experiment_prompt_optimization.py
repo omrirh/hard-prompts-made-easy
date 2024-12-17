@@ -32,7 +32,7 @@ def main():
         tokenizer=tokenizer,
         preprocess=None,
         args=optim_args,
-        device=0,
+        device=torch.device("cuda"),
         target_prompts=[EXAMPLE_PROMPT]
     )
 

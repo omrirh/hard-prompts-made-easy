@@ -1,19 +1,14 @@
 import random
 import numpy as np
-import requests
-from io import BytesIO
-from PIL import Image
 from statistics import mean
 import copy
 import json
 from typing import Any, Mapping
 
-import open_clip
-
 import torch
 
-from sentence_transformers.util import (semantic_search, 
-                                        dot_score, 
+from sentence_transformers.util import (semantic_search,
+                                        dot_score,
                                         normalize_embeddings)
 
 
@@ -25,30 +20,30 @@ def read_json(filename: str) -> Mapping[str, Any]:
 
 def nn_project(curr_embeds, embedding_layer, print_hits=False):
     with torch.no_grad():
-        bsz,seq_len,emb_dim = curr_embeds.shape
-        
-        # Using the sentence transformers semantic search which is 
-        # a dot product exact kNN search between a set of 
+        bsz, seq_len, emb_dim = curr_embeds.shape
+
+        # Using the sentence transformers semantic search which is
+        # a dot product exact kNN search between a set of
         # query vectors and a corpus of vectors
-        curr_embeds = curr_embeds.reshape((-1,emb_dim))
-        curr_embeds = normalize_embeddings(curr_embeds) # queries
+        curr_embeds = curr_embeds.reshape((-1, emb_dim))
+        curr_embeds = normalize_embeddings(curr_embeds)  # queries
 
         embedding_matrix = embedding_layer.weight
         embedding_matrix = normalize_embeddings(embedding_matrix)
-        
-        hits = semantic_search(curr_embeds, embedding_matrix, 
-                                query_chunk_size=curr_embeds.shape[0], 
-                                top_k=1,
-                                score_function=dot_score)
+
+        hits = semantic_search(curr_embeds, embedding_matrix,
+                               query_chunk_size=curr_embeds.shape[0],
+                               top_k=1,
+                               score_function=dot_score)
 
         if print_hits:
             all_hits = []
             for hit in hits:
                 all_hits.append(hit[0]["score"])
             print(f"mean hits:{mean(all_hits)}")
-        
+
         nn_indices = torch.tensor([hit[0]["corpus_id"] for hit in hits], device=curr_embeds.device)
-        nn_indices = nn_indices.reshape((bsz,seq_len))
+        nn_indices = nn_indices.reshape((bsz, seq_len))
 
         projected_embeds = embedding_layer(nn_indices)
 
@@ -83,23 +78,24 @@ def decode_ids(input_ids, tokenizer, by_token=False):
     return texts
 
 
-def download_image(url):
-    try:
-        response = requests.get(url)
-    except:
-        return None
-    return Image.open(BytesIO(response.content)).convert("RGB")
+def get_target_feature(model, tokenizer, device, target_prompts=None):
+    # Tokenize prompts
+    tokenized_inputs = tokenizer(target_prompts, return_tensors="pt", padding=True, truncation=True).to(device)
 
+    # Forward pass to get the hidden states
+    with torch.no_grad():
+        outputs = model(**tokenized_inputs, output_hidden_states=True)
+        last_hidden_state = outputs.hidden_states[-1]  # Last layer hidden states
 
-def get_target_feature(model, preprocess, tokenizer_funct, device, target_images=None, target_prompts=None):
-    if target_images is not None:
-        with torch.no_grad():
-            curr_images = [preprocess(i).unsqueeze(0) for i in target_images]
-            curr_images = torch.concatenate(curr_images).to(device)
-            all_target_features = model.encode_image(curr_images)
-    else:
-        texts = tokenizer_funct(target_prompts).to(device)
-        all_target_features = model.encode_text(texts)
+    # Extract [EOS] token embeddings for each prompt
+    eos_token_id = tokenizer.eos_token_id
+    eos_embeddings = []
+    for i, input_ids in enumerate(tokenized_inputs['input_ids']):
+        eos_position = (input_ids == eos_token_id).nonzero(as_tuple=True)[0].item()  # Find position of EOS token
+        eos_embeddings.append(last_hidden_state[i, eos_position])
+
+    # Stack embeddings
+    all_target_features = torch.stack(eos_embeddings)
 
     return all_target_features
 
@@ -128,7 +124,7 @@ def initialize_prompt(tokenizer, token_embedding, args, device):
     tmp_dummy_ids[tmp_dummy_ids == -1] = 0
     dummy_embeds = token_embedding(tmp_dummy_ids).detach()
     dummy_embeds.requires_grad = False
-    
+
     return prompt_embeds, dummy_embeds, dummy_ids
 
 
@@ -157,9 +153,9 @@ def optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features,
         else:
             curr_indx = torch.randperm(len(all_target_features))
             target_features = all_target_features[curr_indx][0:batch_size]
-            
+
         universal_target_features = all_target_features
-        
+
         # forward projection
         projected_embeds, nn_indices = nn_project(prompt_embeds, token_embedding, print_hits=False)
 
@@ -172,24 +168,24 @@ def optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features,
             scores_per_prompt = logits_per_image.mean(dim=0)
             universal_cosim_score = scores_per_prompt.max().item()
             best_indx = scores_per_prompt.argmax().item()
-        
+
         # tmp_embeds = copy.deepcopy(prompt_embeds)
         tmp_embeds = prompt_embeds.detach().clone()
         tmp_embeds.data = projected_embeds.data
         tmp_embeds.requires_grad = True
-        
+
         # padding
         # padded_embeds = copy.deepcopy(dummy_embeds)
         padded_embeds = dummy_embeds.detach().clone()
         padded_embeds[dummy_ids == -1] = tmp_embeds.reshape(-1, p_dim)
-        
+
         logits_per_image, _ = model.forward_text_embedding(padded_embeds, dummy_ids, target_features)
         cosim_scores = logits_per_image
         loss = 1 - cosim_scores.mean()
         loss = loss * args.loss_weight
-        
+
         prompt_embeds.grad, = torch.autograd.grad(loss, [tmp_embeds])
-        
+
         input_optimizer.step()
         input_optimizer.zero_grad()
 
@@ -197,7 +193,7 @@ def optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features,
         cosim_scores = cosim_scores.mean().item()
 
         decoded_text = decode_ids(nn_indices, tokenizer)[best_indx]
-        if print_step is not None and (step % print_step == 0 or step == opt_iters-1):
+        if print_step is not None and (step % print_step == 0 or step == opt_iters - 1):
             per_step_message = f"step: {step}, lr: {curr_lr}"
             if not print_new_best:
                 per_step_message = f"\n{per_step_message}, cosim: {universal_cosim_score:.3f}, text: {decoded_text}"
@@ -210,7 +206,6 @@ def optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features,
                 print(f"new best cosine sim: {best_sim}")
                 print(f"new best prompt: {best_text}")
 
-
     if print_step is not None:
         print()
         print(f"best cosine sim: {best_sim}")
@@ -220,16 +215,17 @@ def optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features,
 
 
 def optimize_prompt(model, tokenizer, preprocess, args, device, target_images=None, target_prompts=None):
-    token_embedding = model.token_embedding
+    token_embedding = model.model.embed_tokens
 
     # get target features
-    all_target_features = get_target_feature(model, preprocess, tokenizer, device, target_images=target_images, target_prompts=target_prompts)
+    all_target_features = get_target_feature(model, preprocess, tokenizer, device, target_images=target_images,
+                                             target_prompts=target_prompts)
 
     # optimize prompt
     learned_prompt = optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features, args, device)
 
     return learned_prompt
-    
+
 
 def measure_similarity(orig_images, images, ref_model, ref_clip_preprocess, device):
     with torch.no_grad():
@@ -238,11 +234,11 @@ def measure_similarity(orig_images, images, ref_model, ref_clip_preprocess, devi
 
         gen_batch = [ref_clip_preprocess(i).unsqueeze(0) for i in images]
         gen_batch = torch.concatenate(gen_batch).to(device)
-        
+
         ori_feat = ref_model.encode_image(ori_batch)
         gen_feat = ref_model.encode_image(gen_batch)
-        
+
         ori_feat = ori_feat / ori_feat.norm(dim=1, keepdim=True)
         gen_feat = gen_feat / gen_feat.norm(dim=1, keepdim=True)
-        
+
         return (ori_feat @ gen_feat.t()).mean().item()
