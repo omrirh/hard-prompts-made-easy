@@ -4,18 +4,20 @@ from transformers import (
     AutoModelForCausalLM,
 )
 
-EXAMPLE_PROMPT = """
+GSM8K_EXAMPLE_PROMPT = """
 Amaya scored 20 marks fewer in Maths than she scored in Arts.
 She also got 10 marks more in Social Studies than she got in Music.
 If she scored 70 in Music and scored 1/10 less in Maths,
 what's the total number of marks she scored in all the subjects?
+"""
+HOTPOTQA_EXAMPLE_PROMPT = """
 """
 MODEL_NAME = "meta-llama/Meta-Llama-3-8B-Instruct"
 
 
 def main():
     optim_args = {
-        "prompt_len": len(EXAMPLE_PROMPT),
+        "prompt_len": len(GSM8K_EXAMPLE_PROMPT),
         "iter": 3000,
         "lr": 0.1,
         "weight_decay": 0.1,
@@ -30,15 +32,14 @@ def main():
     optimized_example = optimize_prompt(
         model=model,
         tokenizer=tokenizer,
-        preprocess=None,
         args=optim_args,
         device=torch.device("cuda"),
-        target_prompts=[EXAMPLE_PROMPT]
+        target_prompts=[GSM8K_EXAMPLE_PROMPT]
     )
 
     print(f"Original Prompt:"
           f"----------------"
-          f"{EXAMPLE_PROMPT}\n\n")
+          f"{GSM8K_EXAMPLE_PROMPT}\n\n")
 
     print(f"Optimized Prompt:"
           f"-----------------"

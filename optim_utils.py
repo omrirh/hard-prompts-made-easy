@@ -79,19 +79,39 @@ def decode_ids(input_ids, tokenizer, by_token=False):
 
 
 def get_target_feature(model, tokenizer, device, target_prompts=None):
-    # Tokenize prompts
-    tokenized_inputs = tokenizer(target_prompts, return_tensors="pt", padding=True, truncation=True).to(device)
+    # Add pad_token if missing
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # Tokenize prompts and ensure EOS token is added
+    tokenized_inputs = tokenizer(
+        target_prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=512,
+        add_special_tokens=True  # Ensures EOS token is added
+    )
+
+    # Move inputs to the device
+    input_ids = tokenized_inputs['input_ids'].to(device)
+
+    # Move the model to the correct device
+    model = model.to(device)
 
     # Forward pass to get the hidden states
     with torch.no_grad():
-        outputs = model(**tokenized_inputs, output_hidden_states=True)
+        outputs = model(input_ids=input_ids, output_hidden_states=True)
         last_hidden_state = outputs.hidden_states[-1]  # Last layer hidden states
 
-    # Extract [EOS] token embeddings for each prompt
-    eos_token_id = tokenizer.eos_token_id
+    # Extract [EOS] token embeddings
+    eos_token_id = tokenizer.eos_token_id or tokenizer.convert_tokens_to_ids("</s>")
     eos_embeddings = []
-    for i, input_ids in enumerate(tokenized_inputs['input_ids']):
-        eos_position = (input_ids == eos_token_id).nonzero(as_tuple=True)[0].item()  # Find position of EOS token
+    for i, ids in enumerate(input_ids):
+        eos_positions = (ids == eos_token_id).nonzero(as_tuple=True)
+        if len(eos_positions[0]) == 0:
+            raise ValueError("EOS token not found in input_ids. Check tokenizer and inputs.")
+        eos_position = eos_positions[0][-1].item()  # Last occurrence of EOS
         eos_embeddings.append(last_hidden_state[i, eos_position])
 
     # Stack embeddings
@@ -214,12 +234,11 @@ def optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features,
     return best_text
 
 
-def optimize_prompt(model, tokenizer, preprocess, args, device, target_images=None, target_prompts=None):
+def optimize_prompt(model, tokenizer, args, device, target_prompts=None):
     token_embedding = model.model.embed_tokens
 
     # get target features
-    all_target_features = get_target_feature(model, preprocess, tokenizer, device, target_images=target_images,
-                                             target_prompts=target_prompts)
+    all_target_features = get_target_feature(model, tokenizer, device, target_prompts=target_prompts)
 
     # optimize prompt
     learned_prompt = optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features, args, device)
