@@ -1,53 +1,23 @@
 import random
 import numpy as np
-from statistics import mean
 import copy
 import json
 from typing import Any, Mapping
 
 import torch
+from transformers import PreTrainedTokenizer, PreTrainedModel
+import warnings
 
-from sentence_transformers.util import (semantic_search,
-                                        dot_score,
-                                        normalize_embeddings)
+# Suppress warnings for beta APIs in torchvision
+warnings.filterwarnings(
+    "ignore",
+    message=".*torchvision.datapoints and torchvision.transforms.v2 namespaces are still Beta.*")
 
 
 def read_json(filename: str) -> Mapping[str, Any]:
     """Returns a Python dict representation of JSON object at input file."""
     with open(filename) as fp:
         return json.load(fp)
-
-
-def nn_project(curr_embeds, embedding_layer, print_hits=False):
-    with torch.no_grad():
-        bsz, seq_len, emb_dim = curr_embeds.shape
-
-        # Using the sentence transformers semantic search which is
-        # a dot product exact kNN search between a set of
-        # query vectors and a corpus of vectors
-        curr_embeds = curr_embeds.reshape((-1, emb_dim))
-        curr_embeds = normalize_embeddings(curr_embeds)  # queries
-
-        embedding_matrix = embedding_layer.weight
-        embedding_matrix = normalize_embeddings(embedding_matrix)
-
-        hits = semantic_search(curr_embeds, embedding_matrix,
-                               query_chunk_size=curr_embeds.shape[0],
-                               top_k=1,
-                               score_function=dot_score)
-
-        if print_hits:
-            all_hits = []
-            for hit in hits:
-                all_hits.append(hit[0]["score"])
-            print(f"mean hits:{mean(all_hits)}")
-
-        nn_indices = torch.tensor([hit[0]["corpus_id"] for hit in hits], device=curr_embeds.device)
-        nn_indices = nn_indices.reshape((bsz, seq_len))
-
-        projected_embeds = embedding_layer(nn_indices)
-
-    return projected_embeds, nn_indices
 
 
 def set_random_seed(seed=0):
@@ -59,7 +29,7 @@ def set_random_seed(seed=0):
     random.seed(seed + 5)
 
 
-def decode_ids(input_ids, tokenizer, by_token=False):
+def decode_ids(input_ids, tokenizer: PreTrainedTokenizer, by_token=False):
     input_ids = input_ids.detach().cpu().numpy()
 
     texts = []
@@ -78,186 +48,160 @@ def decode_ids(input_ids, tokenizer, by_token=False):
     return texts
 
 
-def get_target_feature(model, tokenizer, device, target_prompts=None):
-    # Add pad_token if missing
+def get_target_feature(model: PreTrainedModel, tokenizer: PreTrainedTokenizer, device, target_prompts=None):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Tokenize prompts and ensure EOS token is added
+    # Ensure EOS token exists
+    if tokenizer.eos_token_id is None:
+        tokenizer.add_special_tokens({'eos_token': '</s>'})
+    eos_token_id = tokenizer.eos_token_id
+
+    # Append EOS token explicitly to prompts
+    target_prompts = [prompt + tokenizer.eos_token for prompt in target_prompts]
+
     tokenized_inputs = tokenizer(
         target_prompts,
         return_tensors="pt",
         padding=True,
         truncation=True,
         max_length=512,
-        add_special_tokens=True  # Ensures EOS token is added
-    )
+        add_special_tokens=False  # Avoid automatic addition
+    ).to(device)
 
-    # Move inputs to the device
-    input_ids = tokenized_inputs['input_ids'].to(device)
-
-    # Move the model to the correct device
+    input_ids = tokenized_inputs['input_ids']
     model = model.to(device)
 
-    # Forward pass to get the hidden states
     with torch.no_grad():
-        outputs = model(input_ids=input_ids, output_hidden_states=True)
-        last_hidden_state = outputs.hidden_states[-1]  # Last layer hidden states
+        outputs = model(input_ids=input_ids, output_hidden_states=True, return_dict=True)
+        last_hidden_state = outputs.hidden_states[-1]
 
-    # Extract [EOS] token embeddings
-    eos_token_id = tokenizer.eos_token_id or tokenizer.convert_tokens_to_ids("</s>")
     eos_embeddings = []
     for i, ids in enumerate(input_ids):
         eos_positions = (ids == eos_token_id).nonzero(as_tuple=True)
         if len(eos_positions[0]) == 0:
             raise ValueError("EOS token not found in input_ids. Check tokenizer and inputs.")
-        eos_position = eos_positions[0][-1].item()  # Last occurrence of EOS
+        eos_position = eos_positions[0][-1].item()
         eos_embeddings.append(last_hidden_state[i, eos_position])
 
-    # Stack embeddings
     all_target_features = torch.stack(eos_embeddings)
-
     return all_target_features
 
 
-def initialize_prompt(tokenizer, token_embedding, args, device):
-    prompt_len = args.prompt_len
+def nn_project(curr_embeds, embedding_layer):
+    with torch.no_grad():
+        # Ensure embeddings are in float32 for stable normalization
+        curr_embeds = curr_embeds.float()
+        bsz, seq_len, emb_dim = curr_embeds.shape
 
-    # randomly optimize prompt embeddings
-    prompt_ids = torch.randint(len(tokenizer.encoder), (args.prompt_bs, prompt_len)).to(device)
-    prompt_embeds = token_embedding(prompt_ids).detach()
-    prompt_embeds.requires_grad = True
+        # Normalize embeddings
+        curr_embeds = curr_embeds.reshape((-1, emb_dim))
+        curr_embeds = torch.nn.functional.normalize(curr_embeds, p=2, dim=-1)
 
-    # initialize the template
-    template_text = "{}"
-    padded_template_text = template_text.format(" ".join(["<start_of_text>"] * prompt_len))
-    dummy_ids = tokenizer.encode(padded_template_text)
+        # Normalize embedding matrix
+        embedding_matrix = embedding_layer.weight.float()
+        embedding_matrix = torch.nn.functional.normalize(embedding_matrix, p=2, dim=-1)
 
-    # -1 for optimized tokens
-    dummy_ids = [i if i != 49406 else -1 for i in dummy_ids]
-    dummy_ids = [49406] + dummy_ids + [49407]
-    dummy_ids += [0] * (77 - len(dummy_ids))
-    dummy_ids = torch.tensor([dummy_ids] * args.prompt_bs).to(device)
+        # Compute cosine similarity manually
+        similarity = torch.matmul(curr_embeds, embedding_matrix.T)
 
-    # for getting dummy embeds; -1 won't work for token_embedding
-    tmp_dummy_ids = copy.deepcopy(dummy_ids)
-    tmp_dummy_ids[tmp_dummy_ids == -1] = 0
-    dummy_embeds = token_embedding(tmp_dummy_ids).detach()
-    dummy_embeds.requires_grad = False
+        # Find nearest neighbors
+        nn_indices = torch.argmax(similarity, dim=-1)
 
-    return prompt_embeds, dummy_embeds, dummy_ids
+        # Reshape indices back to original batch size
+        nn_indices = nn_indices.reshape((bsz, seq_len))
+
+        # Map to embeddings
+        projected_embeds = embedding_layer(nn_indices)
+
+    return projected_embeds, nn_indices
 
 
-def optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features, args, device):
-    opt_iters = args.iter
-    lr = args.lr
-    weight_decay = args.weight_decay
-    print_step = args.print_step
-    batch_size = args.batch_size
-    print_new_best = getattr(args, 'print_new_best', False)
+def optimize_prompt_loop(model, tokenizer, prompt_embeds, all_target_features, args, tokenized_prompts):
+    opt_iters = args['iter']
+    lr = 0.001  # Updated learning rate to 0.001
+    weight_decay = args['weight_decay']
+    print_step = args['print_step']
 
-    # initialize prompt
-    prompt_embeds, dummy_embeds, dummy_ids = initialize_prompt(tokenizer, token_embedding, args, device)
-    p_bs, p_len, p_dim = prompt_embeds.shape
+    # Ensure prompt_embeds is a leaf tensor
+    prompt_embeds = prompt_embeds.clone().detach().to('cuda:0').requires_grad_(True)
 
-    # get optimizer
     input_optimizer = torch.optim.AdamW([prompt_embeds], lr=lr, weight_decay=weight_decay)
 
-    best_sim = -1000 * args.loss_weight
+    best_sim = -1000 * args['loss_weight']
     best_text = ""
 
     for step in range(opt_iters):
-        # randomly sample sample images and get features
-        if batch_size is None:
-            target_features = all_target_features
-        else:
-            curr_indx = torch.randperm(len(all_target_features))
-            target_features = all_target_features[curr_indx][0:batch_size]
+        # Project embeddings to nearest neighbors
+        projected_embeds, nn_indices = nn_project(prompt_embeds, model.get_input_embeddings())
 
-        universal_target_features = all_target_features
+        # Update prompt_embeds with projected embeddings
+        prompt_embeds = projected_embeds.clone().detach().requires_grad_(True)
 
-        # forward projection
-        projected_embeds, nn_indices = nn_project(prompt_embeds, token_embedding, print_hits=False)
+        # Compute outputs
+        padded_embeds = prompt_embeds.reshape(1, -1, projected_embeds.shape[-1]).to('cuda:0')
+        outputs = model(inputs_embeds=padded_embeds, output_hidden_states=True, return_dict=True)
+        hidden_states = outputs.hidden_states[-1]
 
-        # get cosine similarity score with all target features
-        with torch.no_grad():
-            # padded_embeds = copy.deepcopy(dummy_embeds)
-            padded_embeds = dummy_embeds.detach().clone()
-            padded_embeds[dummy_ids == -1] = projected_embeds.reshape(-1, p_dim)
-            logits_per_image, _ = model.forward_text_embedding(padded_embeds, dummy_ids, universal_target_features)
-            scores_per_prompt = logits_per_image.mean(dim=0)
-            universal_cosim_score = scores_per_prompt.max().item()
-            best_indx = scores_per_prompt.argmax().item()
+        # Extract EOS embeddings
+        eos_positions = [(ids == tokenizer.eos_token_id).nonzero(as_tuple=True)[-1][-1].item() for ids in
+                         tokenized_prompts['input_ids']]
+        eos_positions = torch.tensor(eos_positions, device='cuda:0')
+        prompt_features = hidden_states[:, eos_positions, :]
 
-        # tmp_embeds = copy.deepcopy(prompt_embeds)
-        tmp_embeds = prompt_embeds.detach().clone()
-        tmp_embeds.data = projected_embeds.data
-        tmp_embeds.requires_grad = True
+        # Compute cosine similarity
+        prompt_features = torch.nn.functional.normalize(prompt_features, p=2, dim=-1)
+        all_target_features = torch.nn.functional.normalize(all_target_features, p=2, dim=-1)
+        cosim_scores = torch.nn.functional.cosine_similarity(prompt_features, all_target_features, dim=-1)
 
-        # padding
-        # padded_embeds = copy.deepcopy(dummy_embeds)
-        padded_embeds = dummy_embeds.detach().clone()
-        padded_embeds[dummy_ids == -1] = tmp_embeds.reshape(-1, p_dim)
+        # Loss computation
+        loss = 1 - cosim_scores.mean() * args['loss_weight']
 
-        logits_per_image, _ = model.forward_text_embedding(padded_embeds, dummy_ids, target_features)
-        cosim_scores = logits_per_image
-        loss = 1 - cosim_scores.mean()
-        loss = loss * args.loss_weight
+        # Debug logs
+        print(f"Step {step}: Loss {loss.item():.4f}")
 
-        prompt_embeds.grad, = torch.autograd.grad(loss, [tmp_embeds])
-
-        input_optimizer.step()
+        # Gradient update
         input_optimizer.zero_grad()
+        loss.backward()
 
-        curr_lr = input_optimizer.param_groups[0]["lr"]
-        cosim_scores = cosim_scores.mean().item()
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(prompt_embeds, max_norm=0.1)
 
-        decoded_text = decode_ids(nn_indices, tokenizer)[best_indx]
-        if print_step is not None and (step % print_step == 0 or step == opt_iters - 1):
-            per_step_message = f"step: {step}, lr: {curr_lr}"
-            if not print_new_best:
-                per_step_message = f"\n{per_step_message}, cosim: {universal_cosim_score:.3f}, text: {decoded_text}"
-            print(per_step_message)
+        # Optimizer step
+        input_optimizer.step()
 
-        if best_sim * args.loss_weight < universal_cosim_score * args.loss_weight:
-            best_sim = universal_cosim_score
-            best_text = decoded_text
-            if print_new_best:
-                print(f"new best cosine sim: {best_sim}")
-                print(f"new best prompt: {best_text}")
+        # Track best embeddings and prompt text
+        if loss.item() < best_sim:
+            best_sim = loss.item()
+            best_text = decode_ids(nn_indices, tokenizer)[0]
 
-    if print_step is not None:
-        print()
-        print(f"best cosine sim: {best_sim}")
-        print(f"best prompt: {best_text}")
+        print(f"Best Prompt: {best_text}")
+
+    print(f"Final Prompt: {best_text}")
 
     return best_text
 
 
 def optimize_prompt(model, tokenizer, args, device, target_prompts=None):
-    token_embedding = model.model.embed_tokens
+    model = model.to(device)
 
-    # get target features
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    target_prompts = [prompt + tokenizer.eos_token for prompt in target_prompts]
+
+    tokenized_prompts = tokenizer(
+        target_prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=512,
+        add_special_tokens=False
+    ).to(device)
+
+    token_embedding = model.get_input_embeddings()
+    prompt_embeds = token_embedding(tokenized_prompts['input_ids']).clone().detach().to('cuda:0').requires_grad_(True)
+
     all_target_features = get_target_feature(model, tokenizer, device, target_prompts=target_prompts)
-
-    # optimize prompt
-    learned_prompt = optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features, args, device)
-
+    learned_prompt = optimize_prompt_loop(model, tokenizer, prompt_embeds, all_target_features, args, tokenized_prompts)
     return learned_prompt
-
-
-def measure_similarity(orig_images, images, ref_model, ref_clip_preprocess, device):
-    with torch.no_grad():
-        ori_batch = [ref_clip_preprocess(i).unsqueeze(0) for i in orig_images]
-        ori_batch = torch.concatenate(ori_batch).to(device)
-
-        gen_batch = [ref_clip_preprocess(i).unsqueeze(0) for i in images]
-        gen_batch = torch.concatenate(gen_batch).to(device)
-
-        ori_feat = ref_model.encode_image(ori_batch)
-        gen_feat = ref_model.encode_image(gen_batch)
-
-        ori_feat = ori_feat / ori_feat.norm(dim=1, keepdim=True)
-        gen_feat = gen_feat / gen_feat.norm(dim=1, keepdim=True)
-
-        return (ori_feat @ gen_feat.t()).mean().item()
